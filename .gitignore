@@ -19,3 +19,7 @@ data/**/hdf5_data_final/
 figures/*
 !figures/.gitkeep
 
+
+# Pretrained baseline artifacts (too large for GitHub)
+data/t15_pretrained_rnn_baseline/**/checkpoint/best_checkpoint
+
