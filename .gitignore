@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Outputs / artifacts
+checkpoints/
+outputs/
+
+# Large data
+data/**/*.hdf5
+data/**/hdf5_data_final/
+
+# IDE / tooling
+.cursor/
+.vscode/
+
+# Figures (keep placeholder)
+figures/*
+!figures/.gitkeep
+
