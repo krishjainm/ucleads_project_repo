@@ -54,13 +54,14 @@ class BrainTextDataset(Dataset):
             else:
                 y = g["seq_class_ids"][()].astype(np.int64)
 
-        # Many datasets use 0 as padding, remove all zeros.
+        # Trim trailing padding zeros only (do NOT delete zeros in the middle)
+        # Assumption: 0 is padding in the stored target, not a real label token.
         if y.size > 0:
-            y = y[y != 0]
-
-        # Remove any blank tokens from targets, CTC blank is 0 and must not appear in targets
-        if y.size > 0:
-            y = y[y != 0]
+            nz = np.nonzero(y)[0]
+            if len(nz) == 0:
+                y = y[:0]
+            else:
+                y = y[: nz[-1] + 1]
 
         # Normalize x if stats provided
         if self.mean is not None and self.std is not None:
@@ -218,6 +219,91 @@ def train_epoch(
 # -------------------------
 # Norm stats
 # -------------------------
+@torch.no_grad()
+def eval_epoch(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    for neural, labels, neural_lengths, label_lengths in dataloader:
+        neural = neural.to(device)
+        labels = labels.to(device)
+        neural_lengths = neural_lengths.to(device)
+        label_lengths = label_lengths.to(device)
+
+        keep = (label_lengths > 0) & (label_lengths <= neural_lengths)
+        if keep.sum().item() == 0:
+            continue
+
+        neural = neural[keep]
+        neural_lengths_kept = neural_lengths[keep]
+        label_lengths_kept = label_lengths[keep]
+
+        # Rebuild concatenated labels for kept samples
+        kept = []
+        idx = 0
+        for b in range(len(label_lengths)):
+            L = int(label_lengths[b].item())
+            if keep[b].item():
+                kept.append(labels[idx:idx + L])
+            idx += L
+
+        labels_kept = torch.cat(kept, dim=0) if len(kept) else torch.zeros((0,), dtype=torch.long, device=device)
+
+        logits = model(neural).transpose(0, 1)        # (T,B,C)
+        log_probs = torch.log_softmax(logits, dim=2)
+
+        loss = criterion(log_probs, labels_kept, neural_lengths_kept, label_lengths_kept)
+        if not torch.isfinite(loss):
+            continue
+
+        total_loss += float(loss.item())
+        num_batches += 1
+
+    return total_loss / num_batches if num_batches > 0 else float("inf")
+
+@torch.no_grad()
+def eval_epoch(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    for neural, labels, neural_lengths, label_lengths in dataloader:
+        neural = neural.to(device)
+        labels = labels.to(device)
+        neural_lengths = neural_lengths.to(device)
+        label_lengths = label_lengths.to(device)
+
+        keep = (label_lengths > 0) & (label_lengths <= neural_lengths)
+        if keep.sum().item() == 0:
+            continue
+
+        neural = neural[keep]
+        neural_lengths_kept = neural_lengths[keep]
+        label_lengths_kept = label_lengths[keep]
+
+        kept = []
+        idx = 0
+        for b in range(len(label_lengths)):
+            L = int(label_lengths[b].item())
+            if keep[b].item():
+                kept.append(labels[idx:idx + L])
+            idx += L
+
+        labels_kept = torch.cat(kept, dim=0) if len(kept) else torch.zeros((0,), dtype=torch.long, device=device)
+
+        logits = model(neural).transpose(0, 1)  # (T,B,C)
+        log_probs = torch.log_softmax(logits, dim=2)
+
+        loss = criterion(log_probs, labels_kept, neural_lengths_kept, label_lengths_kept)
+        if not torch.isfinite(loss):
+            continue
+
+        total_loss += float(loss.item())
+        num_batches += 1
+
+    return total_loss / num_batches if num_batches > 0 else float("inf")
+
 def compute_and_save_norm_stats(train_h5_path: str, out_path: str):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,7 +319,7 @@ def compute_and_save_norm_stats(train_h5_path: str, out_path: str):
             total_sum += x.sum(axis=0)
             total_sumsq += (x * x).sum(axis=0)
             total_count += x.shape[0]
-
+    
     mean = total_sum / max(1, total_count)
     var = total_sumsq / max(1, total_count) - mean * mean
     var = np.maximum(var, 1e-12)
@@ -245,7 +331,6 @@ def compute_and_save_norm_stats(train_h5_path: str, out_path: str):
     np.savez_compressed(out_path, mean=mean, std=std)
     print("[OK] wrote norm stats to", str(out_path))
     print("mean shape", mean.shape, "std shape", std.shape, "std min", float(std.min()), "std max", float(std.max()))
-
 
 # -------------------------
 # Main
@@ -276,7 +361,7 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
     # scheduler
-    parser.add_argument("--plateau-patience", type=int, default=3)
+    parser.add_argument("--plateau-patience", type=int, default=1)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
 
     # temporal mask augmentation (train only)
@@ -333,8 +418,8 @@ def main():
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=args.plateau_factor, patience=args.plateau_patience
-    )
+    optimizer, mode="min", factor=args.plateau_factor, patience=args.plateau_patience
+)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -346,10 +431,14 @@ def main():
             time_mask_count=args.time_mask_count,
             time_mask_max_width=args.time_mask_max_width,
         )
-        scheduler.step(train_loss)
+
+        val_loss = eval_epoch(model, val_loader, criterion, device)
+        scheduler.step(val_loss)
 
         lr_now = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f} - LR: {lr_now:.6f}")
+        print(
+            f"Epoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - LR: {lr_now:.6f}"
+        )
 
     ckpt_path = os.path.join(args.checkpoint_dir, "final_checkpoint.pt")
     torch.save(
@@ -362,7 +451,6 @@ def main():
         ckpt_path,
     )
     print("Checkpoint saved to", ckpt_path)
-
 
 if __name__ == "__main__":
     main()
