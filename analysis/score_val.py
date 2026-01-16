@@ -50,7 +50,7 @@ def main():
     with h5py.File(args.val_hdf5, "r") as f:
         trial_ids = list(f.keys())
         for tid in trial_ids:
-            gt = trim_zeros_right(f[tid]["transcription"][:])
+            gt = f[tid]["seq_class_ids"][:].astype(int)
             if tid not in pred_map:
                 missing += 1
                 continue
